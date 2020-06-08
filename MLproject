@@ -1,0 +1,8 @@
+name: gatas
+
+entry_points:
+  train-link-predictor:
+    command: "python3.7 -m link_prediction.train"
+
+  train-node-classifier:
+    command: "python3.7 -m node_classification.train"
