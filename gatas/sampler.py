@@ -1,6 +1,6 @@
 import math
 import os
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Tuple, Union
 
 import numba
 import numpy as np
@@ -19,24 +19,24 @@ class NeighbourSample(NamedTuple):
 class NeighbourSampler(tf.Module):
     def __init__(
             self,
-            accumulated_transition_lengths: np.ndarray,
-            neighbours: np.ndarray,
-            path_indices: np.ndarray,
-            probabilities: np.ndarray,
+            accumulated_transition_lengths: Union[np.ndarray, tf.Tensor],
+            neighbours: Union[np.ndarray, tf.Tensor],
+            path_indices: Union[np.ndarray, tf.Tensor],
+            probabilities: Union[np.ndarray, tf.Tensor],
             num_edge_types: int,
             num_steps: int) -> None:
 
         super().__init__()
 
-        self.accumulated_transition_lengths = accumulated_transition_lengths
-        self.neighbours = neighbours
-        self.path_indices = path_indices
-        self.probabilities = probabilities
+        self.accumulated_transition_lengths = tf.convert_to_tensor(accumulated_transition_lengths)
+        self.neighbours = tf.convert_to_tensor(neighbours)
+        self.path_indices = tf.convert_to_tensor(path_indices)
+        self.probabilities = tf.convert_to_tensor(probabilities)
 
         self.num_edge_types = num_edge_types
         self.num_steps = num_steps
 
-        self.path_depths = compute_path_depths(num_steps, num_edge_types)
+        self.path_depths = tf.convert_to_tensor(compute_path_depths(num_steps, num_edge_types))
 
         self.coefficients = tf.Variable(
             initial_value=self.compute_initial_coefficients(num_steps),
@@ -54,13 +54,10 @@ class NeighbourSampler(tf.Module):
 
     @classmethod
     def from_path(cls, num_steps: int, path: str, suffix: str = '') -> 'NeighbourSampler':
-        accumulated_transition_lengths = io.load_npy(
-            path=os.path.join(path, f'accumulated_transition_lengths{suffix}.npy'),
-            mmap_mode='r',
-        )
-        neighbours = io.load_npy(os.path.join(path, f'neighbours{suffix}.npy'), mmap_mode='r')
-        path_indices = io.load_npy(os.path.join(path, f'path_indices{suffix}.npy'), mmap_mode='r')
-        probabilities = io.load_npy(os.path.join(path, f'probabilities{suffix}.npy'), mmap_mode='r')
+        accumulated_transition_lengths = io.load_npy(os.path.join(path, f'accumulated_transition_lengths{suffix}.npy'))
+        neighbours = io.load_npy(os.path.join(path, f'neighbours{suffix}.npy'))
+        path_indices = io.load_npy(os.path.join(path, f'path_indices{suffix}.npy'))
+        probabilities = io.load_npy(os.path.join(path, f'probabilities{suffix}.npy'))
 
         instance = cls(
             accumulated_transition_lengths=accumulated_transition_lengths,
@@ -81,103 +78,130 @@ class NeighbourSampler(tf.Module):
 
         return decaying_distribution
 
-    def __call__(self, node_indices: tf.Tensor, sample_size: int, noisify: bool = True) -> NeighbourSample:
-        step_probabilities = tf.nn.softmax(self.coefficients)
+    @staticmethod
+    def get_sample(
+            logits: tf.Tensor,
+            vector_indices: tf.Tensor,
+            matrix_indices: tf.Tensor,
+            lengths: tf.Tensor,
+            sample_size: int) -> Tuple[tf.Tensor, tf.Tensor]:
 
-        indices, segments, path_indices, steps, probabilities = self.generate_sample(
-            node_indices=node_indices,
-            coefficients=step_probabilities,
+        batch_size = tf.size(lengths)
+        max_length = tf.reduce_max(lengths)
+        k = tf.math.minimum(max_length, sample_size)
+
+        mask = tf.sequence_mask(tf.math.minimum(lengths, k))
+
+        logits_scattered = tf.fill((batch_size, max_length), tf.math.log(0.))
+        logits_scattered = tf.tensor_scatter_nd_update(logits_scattered, matrix_indices, logits)
+
+        top_k_indices = tf.math.top_k(logits_scattered, k)[1]
+        top_k_indices += tf.cumsum(lengths, exclusive=True)[:, tf.newaxis]
+        top_k_indices = tf.boolean_mask(top_k_indices, mask)
+
+        sample_indices = tf.gather(vector_indices, top_k_indices)
+
+        return sample_indices, top_k_indices
+
+    def __call__(self, node_indices: tf.Tensor, sample_size: int, noisify: bool = True) -> NeighbourSample:
+        coefficients = tf.nn.softmax(self.coefficients)
+
+        vector_indices, matrix_indices, lengths = self.filter_transitions(*self.get_segments(node_indices))
+
+        logits = self.calculate_transition_logits(coefficients, vector_indices, noisify=noisify)
+        sample_indices, vector_indices_subset = self.get_sample(
+            logits=logits,
+            vector_indices=vector_indices,
+            matrix_indices=matrix_indices,
+            lengths=lengths,
             sample_size=sample_size,
-            noisify=noisify,
         )
 
-        weights = tf.gather(step_probabilities, steps) * probabilities
+        segments = tf.gather(matrix_indices[:, 0], vector_indices_subset)
+        weights = tf.gather(self.probabilities, sample_indices) * self.gather_with_steps(coefficients, sample_indices)
 
-        sample = NeighbourSample(indices, segments, path_indices, weights)
+        sample = NeighbourSample(
+            indices=tf.gather(self.neighbours, sample_indices),
+            segments=segments,
+            path_indices=tf.gather(self.path_indices, sample_indices),
+            weights=weights,
+        )
 
         return sample
 
-    def generate_sample(
+    def get_segments(self, indices: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        batch_size = tf.size(indices)
+
+        lengths = self.accumulated_transition_lengths[1:] - self.accumulated_transition_lengths[:-1]
+        lengths = tf.gather(lengths, indices)
+
+        max_length = tf.reduce_max(lengths)
+
+        offsets = tf.gather(self.accumulated_transition_lengths, indices)
+        mask = tf.sequence_mask(lengths)
+
+        outer_indices = tf.broadcast_to(tf.range(batch_size, dtype=tf.int32)[:, tf.newaxis], (batch_size, max_length))
+        inner_indices = tf.broadcast_to(tf.range(max_length, dtype=tf.int32), (batch_size, max_length))
+
+        vector_indices = offsets[:, tf.newaxis] + inner_indices
+        vector_indices = tf.boolean_mask(vector_indices, mask)
+
+        matrix_indices = tf.stack((tf.boolean_mask(outer_indices, mask), tf.boolean_mask(inner_indices, mask)), axis=1)
+
+        return vector_indices, matrix_indices, lengths
+
+    def filter_transitions(
             self,
-            node_indices: tf.Tensor,
+            vector_indices: tf.Tensor,
+            matrix_indices: tf.Tensor,
+            lengths: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+
+        batch_size, max_path_index = tf.size(lengths), tf.size(self.path_depths)
+
+        subset_mask = tf.gather(self.path_indices, vector_indices) < max_path_index
+
+        vector_indices_subset = tf.boolean_mask(vector_indices, subset_mask)
+
+        lengths_subset = tf.math.unsorted_segment_sum(
+            data=tf.ones_like(vector_indices_subset, dtype=lengths.dtype),
+            segment_ids=tf.boolean_mask(matrix_indices[:, 0], subset_mask),
+            num_segments=batch_size,
+        )
+
+        max_length, sequence_mask = tf.reduce_max(lengths_subset), tf.sequence_mask(lengths_subset)
+
+        outer_indices = tf.broadcast_to(tf.range(batch_size, dtype=tf.int32)[:, tf.newaxis], (batch_size, max_length))
+        inner_indices = tf.broadcast_to(tf.range(max_length, dtype=tf.int32), (batch_size, max_length))
+        matrix_indices_subset = tf.stack(
+            values=(tf.boolean_mask(outer_indices, sequence_mask), tf.boolean_mask(inner_indices, sequence_mask)),
+            axis=1,
+        )
+
+        return vector_indices_subset, matrix_indices_subset, lengths_subset
+
+    def gather_with_steps(self, coefficients: tf.Tensor, indices: tf.Tensor) -> tf.Tensor:
+        path_indices = tf.gather(self.path_indices, indices)
+        path_depths = tf.gather(self.path_depths, path_indices)
+        coefficients = tf.gather(coefficients, path_depths)
+
+        return coefficients
+
+    def calculate_transition_logits(
+            self,
             coefficients: tf.Tensor,
-            sample_size: int,
-            noisify: bool) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+            indices: tf.Tensor,
+            noisify: bool,
+            eps: float = 1e-20) -> tf.Tensor:
 
-        indices, segments, path_indices, steps, probabilities= tf.numpy_function(
-            func=lambda x, y: generate_sample(
-                node_indices=x,
-                transition_pointers=self.accumulated_transition_lengths,
-                neighbours=self.neighbours,
-                path_indices=self.path_indices,
-                probabilities=self.probabilities,
-                coefficients=y,
-                path_depths=self.path_depths,
-                num_steps=self.num_steps,
-                sample_size=sample_size,
-                noisify=noisify,
-            ),
-            inp=(node_indices, coefficients),
-            Tout=(tf.int32, tf.int32, tf.int32, tf.int32, tf.float32),
-        )
+        probabilities = tf.gather(self.probabilities, indices)
+        coefficients = self.gather_with_steps(coefficients, indices)
 
-        indices.set_shape((None,))
-        segments.set_shape((None,))
-        path_indices.set_shape((None,))
-        steps.set_shape((None,))
-        probabilities.set_shape((None,))
+        joint_probabilities = tf.math.log(probabilities * coefficients)
 
-        return indices, segments, path_indices, steps, probabilities
+        if noisify:
+            joint_probabilities -= tf.math.log(-tf.math.log(tf.random.uniform(tf.shape(probabilities)) + eps) + eps)
 
-
-@numba.njit
-def generate_sample(
-        node_indices: np.ndarray,
-        transition_pointers: np.ndarray,
-        neighbours: np.ndarray,
-        path_indices: np.ndarray,
-        probabilities: np.ndarray,
-        coefficients: np.ndarray,
-        path_depths: np.ndarray,
-        num_steps: int,
-        sample_size: int,
-        noisify: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
-    indices = []
-    segments = []
-    path_indices_subset = []
-    steps = []
-    probabilities_subset = []
-
-    for segment_id, node_index in enumerate(node_indices):
-        start_index, end_index = transition_pointers[node_index], transition_pointers[node_index + 1]
-
-        neighbour_sparse_indices, _ = compute_top_k(
-            probabilities=probabilities[start_index:end_index],
-            path_indices=path_indices[start_index:end_index],
-            path_depths=path_depths,
-            coefficients=coefficients,
-            num_steps=num_steps,
-            k=sample_size,
-            noisify=noisify,
-        )
-
-        for neighbour_sparse_index in neighbour_sparse_indices:
-            neighbour_index = neighbour_sparse_index + start_index
-
-            indices.append(neighbours[neighbour_index])
-            segments.append(segment_id)
-            path_indices_subset.append(path_indices[neighbour_index])
-            steps.append(path_depths[path_indices[neighbour_index]])
-            probabilities_subset.append(probabilities[neighbour_index])
-
-    indices = np.array(indices, dtype=np.int32)
-    segments = np.array(segments, dtype=np.int32)
-    path_indices_subset = np.array(path_indices_subset, dtype=np.int32)
-    steps = np.array(steps, dtype=np.int32)
-    probabilities_subset = np.array(probabilities_subset, dtype=np.float32)
-
-    return indices, segments, path_indices_subset, steps, probabilities_subset
+        return joint_probabilities
 
 
 @numba.njit
@@ -203,81 +227,3 @@ def compute_path_depths(num_steps: int, num_edge_types: int) -> np.ndarray:
         path_depths[path_index] = get_path_depth(path_index, num_edge_types)
 
     return path_depths
-
-
-@numba.njit
-def compute_top_k(
-        probabilities: np.ndarray,
-        path_indices: np.ndarray,
-        path_depths: np.ndarray,
-        coefficients: np.ndarray,
-        num_steps: int,
-        k: int,
-        noisify: bool) -> Tuple[np.ndarray, np.ndarray]:
-
-    top_indices = np.full(fill_value=-1, shape=(k,), dtype=np.int32)
-    top_values = np.full(fill_value=-np.inf, shape=(k,), dtype=np.float32)
-
-    if k == 0:
-        return top_indices, top_values
-
-    last_index = k - 1
-
-    for index, probability in enumerate(probabilities):
-        step = path_depths[path_indices[index]]
-
-        if step > num_steps:
-            continue
-
-        value = calculate_transition_logits(probability, coefficients[step], noisify=noisify)
-
-        if value <= top_values[0]:
-            continue
-
-        # heap bubble-down operation
-        node_index = 0
-
-        top_indices[node_index], top_values[node_index] = index, value
-
-        while True:
-            child_index = 2 * node_index + 1
-
-            swap_index = node_index
-
-            if child_index <= last_index and top_values[node_index] > top_values[child_index]:
-                swap_index = child_index
-
-            if child_index + 1 <= last_index and top_values[swap_index] > top_values[child_index + 1]:
-                swap_index = child_index + 1
-
-            if swap_index == node_index:
-                break
-
-            temp_index, temp_value = top_indices[swap_index], top_values[swap_index]
-            top_indices[swap_index] = top_indices[node_index]
-            top_values[swap_index] = top_values[node_index]
-            top_indices[node_index], top_values[node_index] = temp_index, temp_value
-
-            node_index = swap_index
-
-    # extract indices from fixed-length heaps
-    indices = np.where(top_indices >= 0)[0]
-    top_indices, top_values = top_indices[indices], top_values[indices]
-
-    return top_indices, top_values
-
-
-@numba.njit
-def calculate_transition_logits(
-        probabilities: np.ndarray,
-        coefficients: np.ndarray,
-        noisify: bool,
-        eps: float = 1e-20) -> float:
-
-    logits = np.log(probabilities * coefficients)
-
-    if noisify:
-        gumbel_sample = -np.log(-np.log(np.random.random(np.shape(probabilities)) + eps) + eps)
-        logits += gumbel_sample
-
-    return logits
