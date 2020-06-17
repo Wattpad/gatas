@@ -10,7 +10,7 @@ This repository is organized as follows:
 - `framework/` contains helper libraries for model development, training and evaluation.
 - `gatas/` contains the implementation of GATAS.
 - `node_classification/` contains a node label classifier using the model.
-- `link_prediction/` contains a link prediction model using the model.
+- `link_prediction/` contains a link predictor using the model.
 
 
 ## Instructions
