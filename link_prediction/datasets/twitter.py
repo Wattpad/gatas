@@ -137,9 +137,9 @@ def create_node_ids(path: str, num_nodes: Optional[int] = None) -> Mapping[int, 
 
 
 def generate_sample(num_nodes: int, num_edge_types: int) -> Tuple[int, int, int]:
-    head = random.randint(0, num_nodes - 1)
-    tail = random.randint(0, num_nodes - 1)
-    edge_type = random.randint(0, num_edge_types - 1)
+    head = random.randrange(0, num_nodes)
+    tail = random.randrange(0, num_nodes)
+    edge_type = random.randrange(0, num_edge_types)
 
     return head, tail, edge_type
 
